@@ -1,0 +1,214 @@
+#!/usr/bin/env Rscript
+
+setwd("/work/hgrlab/agomaa/TWAS_Sorghum/traits_sp_TWAS")
+rm(list = ls())
+
+# # Define the path to the text file containing the arguments
+# args_file <- "/work/hgrlab/agomaa/TWAS_Sorghum/traits_sp_TWAS/pheno.txt"
+# 
+# #args <- scan(args_file, what = "character", sep = "\n")
+# args <- commandArgs(trailingOnly = TRUE)
+#  str(args)
+#  cat(args, sep = "\n")
+# 
+# args[1]
+# args[2]
+
+args <- commandArgs(trailingOnly = TRUE)
+str(args)
+cat(args, sep = "\n")
+
+args[1]
+args[2]
+
+
+#chooseCRANmirror(ind=72)
+#source("http://zzlab.net/GAPIT/gapit_functions.txt") #install this directly in R and not here, it will give error
+source("/work/hgrlab/agomaa/TWAS_Sorghum/gapit_functions.txt")
+
+
+
+library("data.table")
+library("tidyverse")
+
+analysis <- "TWAS_farmCPU_RMIP"
+out <- paste0("", analysis)
+
+# Ensure 'TWASres' folder exists
+if (!dir.exists(out)) {
+  dir.create(out)
+}
+
+dateDIR <- as.character(Sys.Date())
+pathout <- file.path(out, dateDIR)
+
+if (!dir.exists(pathout)) {
+  dir.create(pathout)
+}
+
+
+
+#load the new phe data
+phe <- fread("sorghum2021_Spatial.csv",data.table = F) #pheno_693.txt 
+colnames(phe)[26:40]
+
+#writeLines(colnames(phe)[26:40], "pheno3.txt")
+
+trait=which(colnames(phe) == args[1]) #args[1] #Plant Height.sp
+#trait=which(colnames(phe) == "SeedMassPerPlant.sp") 
+colnames(phe[trait])
+
+###calculate means by taxa from phe
+phe.NEmedians <- phe %>%
+  group_by(taxa) %>%
+  dplyr::select(taxa, colnames(phe[trait])) %>%
+  summarise(across(everything(), ~mean(., na.rm = TRUE)))
+
+phe.NEmedians <- data.frame(phe.NEmedians)
+
+
+#load counts data
+counts <- fread("geneExpression_sorghum.txt", data.table = F)
+#counts <- counts[,-1]
+colnames(counts)[1:5]
+colnames(counts)[1] <- "taxa"
+
+row.names(counts) <- counts$taxa
+
+genotypes=row.names(counts)
+phemean=phe.NEmedians %>%
+  filter(taxa %in% genotypes)
+
+# Exclude the first column and convert to numeric
+counts_numeric <- counts[,-1]
+counts_numeric <- lapply(counts_numeric, as.numeric)
+counts_numeric <- as.data.frame(counts_numeric)
+#filters out genes from the counts_numeric data frame based on a criterion (having values greater than 0.1 in at least half of the samples), and then prints the number of genes that meet this criterion.
+keep <- colSums(counts_numeric>.1) >= nrow(counts_numeric)/2
+counts_combined.filtered <- counts_numeric[,keep]
+print(paste0("Genes keeped: ", ncol(counts_combined.filtered)))
+
+
+# Combine with the first column
+counts_combined <- cbind(counts[,1], counts_combined.filtered)
+colnames(counts_combined)[1] <- "taxa"
+row.names(counts_combined) <- counts_combined$taxa
+
+
+prcompResult<-prcomp(counts_combined[,-1],center=TRUE,scale.=TRUE) #This should take less than a minute.
+PCs<-prcompResult$x
+PCsTop <- data.frame(PCs[,1:100])
+PCs.2020 <- cbind(row.names(counts_combined),PCsTop)
+colnames(PCs.2020)[1] <- "taxa"
+
+plot(PCs.2020$PC1, PCs.2020$PC2)
+
+
+NROW(merge(counts_combined[,1], phemean, by = 1))
+
+
+
+#use quantile method to handle outliers
+Quantile<- apply(counts_combined[,-1],2,  # 2 indicates it is for column and 1 indicates it is for row
+                 function(A){min_x=as.numeric(quantile(A,0.05));
+                 max_x=as.numeric(quantile(A,0.95));
+                 out<-(2*(A-min_x)/(max_x-min_x));
+                 out[out>2]<-2;out[out< 0]<- 0;return(out)})
+
+#Quantile.t <-  as.data.frame(t(Quantile))
+Quantile.t <- as.data.frame(Quantile)
+Quantile.t$taxa <- row.names(Quantile.t)
+myGD <-  Quantile.t[,c(ncol(Quantile.t),1: (ncol(Quantile.t)-1))]
+
+
+myY <- phemean
+colnames(myY)[1] <- "taxa"
+
+myGM <- fread("gene_info_sorghum.csv", data.table = F)
+unique(myGM$chr) #only cromosomes 
+#myGM <- myGM[,-1]
+#filter myGM to contains only rows corresponding to gene IDs that are present in the column names of counts_combined, excluding the first column
+myGM <- myGM[myGM$Gene%in% colnames(counts_combined[,-1]),]
+
+
+#covariates
+
+
+
+###calculate means by taxa from anthesis as covariate
+cov.ft <- phe %>%
+  group_by(taxa) %>%
+  dplyr::select(taxa, 'DaysToFlower.sp') %>%
+  summarise(across(everything(), ~mean(., na.rm = TRUE)))
+
+cvF <- data.frame(cov.ft)
+
+
+
+
+cvF <- merge(cvF, PCs.2020[,c(1:4)], by ='taxa')
+
+
+
+#make a conditional statement to remove 'anthesis.sp' as covariate in the trait is a flowering time trait
+if (colnames(phe[trait]) == 'DaysToFlower.sp') {
+  cvF <- cvF[,-3]
+  print("flowering time trait")
+} else {
+  cvF <- cvF
+  print("including flowering time as covariate")
+}
+
+colnames(cvF)
+
+
+#create empty data to run resampling
+gen <- data.frame()
+sampled_rows_list <- list()
+
+# 709*0.9
+# 
+# sum(is.na(phemean[colnames(phe[trait])]))
+# sum(is.na(phemean$taxa))
+
+#i=1
+for (i in 1:100) {
+  # Sample 90% of the rows
+  sampled_rows <- sort(sample(x = length(phemean$taxa), size = round(0.9 * length(phemean$taxa))))
+  sampled_rows_list[[paste0("sampled_rows", i)]] <- sampled_rows
+  
+  # Extract the sampled rows
+  sampled_data <- phemean$taxa[sampled_rows_list[[paste0("sampled_rows", i)]]]
+  
+  datay <- myY[myY$taxa %in% sampled_data,]
+  colnames(datay)
+  
+  dataGD <- myGD[myGD$taxa %in% sampled_data,]
+  
+  myGAPIT <- GAPIT(Y=datay,
+                   GD=dataGD,
+                   GM=myGM,
+                   CV=cvF,
+                   PCA.total=3,
+                   model= "FarmCPU",
+                   SNP.MAF=0,
+                   file.output=F
+  )
+  #warnings()
+  
+  #getting the important genes and Manhattan plots
+  values <- data.frame(myGAPIT$GWAS)
+  values$log <- -log10(values$P.value)
+  threshold <- -log10(0.05/round(0.9 * length(phemean$taxa)))
+  
+  values2 <- values[which(values$log > threshold),]
+  
+  gen <- rbind(gen, values2[c(1,4,8)])
+}
+
+
+results <- data.frame(table(gen$SNP))
+results2 <- merge(myGM, results, by = 1 ,all.x = T)
+
+
+fwrite(results2, paste0(pathout,"/TWAS.CMLM_farmCPU_",colnames(phe[trait]),".csv"))
